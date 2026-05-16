@@ -3,7 +3,7 @@ from unittest import mock
 
 import requests
 
-from services.register.mail_provider import CloudflareTempMailProvider
+from services.register.mail_provider import CloudflareTempMailProvider, YydsMailProvider
 
 
 class FakeResponse:
@@ -58,6 +58,39 @@ class CloudflareTempMailProviderTests(unittest.TestCase):
     def test_request_does_not_retry_invalid_domain(self):
         provider = self.make_provider()
         fake_session = FakeSession([FakeResponse(status_code=400, text="Failed to create address: Invalid domain")])
+        provider.session = fake_session
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            provider.create_mailbox("name")
+
+        self.assertEqual(len(fake_session.calls), 1)
+
+
+class YydsMailProviderTests(unittest.TestCase):
+    def make_provider(self):
+        return YydsMailProvider(
+            {"api_base": "https://maliapi.example/v1", "api_key": "key", "domain": ["example.com"]},
+            {"request_timeout": 1, "wait_timeout": 1, "wait_interval": 0.2, "user_agent": "ua"},
+        )
+
+    def test_create_mailbox_retries_transient_tls_failure(self):
+        provider = self.make_provider()
+        fake_session = FakeSession([
+            requests.exceptions.SSLError("unexpected eof"),
+            FakeResponse(data={"data": {"address": "name@example.com", "token": "mail-token"}}),
+        ])
+        provider.session = fake_session
+
+        with mock.patch("services.register.mail_provider.time.sleep"):
+            mailbox = provider.create_mailbox("name")
+
+        self.assertEqual(mailbox["address"], "name@example.com")
+        self.assertEqual(mailbox["token"], "mail-token")
+        self.assertEqual(len(fake_session.calls), 2)
+
+    def test_request_does_not_retry_bad_request(self):
+        provider = self.make_provider()
+        fake_session = FakeSession([FakeResponse(status_code=400, text="bad domain")])
         provider.session = fake_session
 
         with self.assertRaisesRegex(RuntimeError, "HTTP 400"):

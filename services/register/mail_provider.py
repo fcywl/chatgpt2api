@@ -14,6 +14,8 @@ from typing import Any, Callable, TypeVar
 import requests
 from curl_cffi import requests as curl_requests
 
+from services.register import domain_reputation
+
 
 ResultT = TypeVar("ResultT")
 domain_lock = Lock()
@@ -566,6 +568,7 @@ class InbucketMailProvider(BaseMailProvider):
 
 class YydsMailProvider(BaseMailProvider):
     name = "yyds_mail"
+    retry_statuses = {429, 500, 502, 503, 504}
 
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
@@ -580,7 +583,24 @@ class YydsMailProvider(BaseMailProvider):
 
     def _request(self, method: str, path: str, token: str = "", params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
         headers = {"Authorization": f"Bearer {token}"} if token else {"X-API-Key": self.api_key}
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"YYDSMail 请求异常: {method} {path}, error={last_error}") from exc
+            if resp.status_code in expected:
+                break
+            if resp.status_code in self.retry_statuses and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        else:
+            raise RuntimeError(f"YYDSMail 请求异常: {method} {path}, error={last_error}")
         if resp.status_code not in expected:
             raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         if resp.status_code == 204:
@@ -596,8 +616,11 @@ class YydsMailProvider(BaseMailProvider):
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         payload = {"localPart": username or _random_mailbox_name()}
-        if self.domain:
-            payload["domain"] = _next_domain(self.domain)
+        domains = domain_reputation.store.filter_domains(self.name, self.domain)
+        if not domains:
+            domains = domain_reputation.store.good_domains(self.name)
+        if domains:
+            payload["domain"] = _next_domain(domains)
         if self.subdomain:
             payload["subdomain"] = self.subdomain
         data = self._request("POST", "/accounts/wildcard" if self.wildcard else "/accounts", payload=payload)
@@ -605,7 +628,8 @@ class YydsMailProvider(BaseMailProvider):
         token = str(data.get("token") or data.get("temp_token") or data.get("tempToken") or data.get("access_token") or "").strip()
         if not address or not token:
             raise RuntimeError("YYDSMail 缺少 address 或 token")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token, "account_id": str(data.get("id") or "")}
+        domain = address.rsplit("@", 1)[-1].strip().lower() if "@" in address else str(payload.get("domain") or "").strip().lower()
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "domain": domain, "token": token, "account_id": str(data.get("id") or "")}
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/messages", token=str(mailbox.get("token") or ""), params={"address": mailbox["address"]})
