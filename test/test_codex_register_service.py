@@ -17,6 +17,7 @@ class CodexRegisterServiceTests(unittest.TestCase):
             "access_token": "access-token",
             "refresh_token": "refresh-token",
             "id_token": "id-token",
+            "hero_sms": {"country": 31, "price": 0.05},
         }
         pool = {"id": "pool-1", "base_url": "http://localhost:8317", "secret_key": "secret"}
 
@@ -37,6 +38,33 @@ class CodexRegisterServiceTests(unittest.TestCase):
         self.assertEqual(result["ok"], True)
         self.assertEqual(result["cpa"]["pool_id"], "pool-1")
         self.assertEqual(result["cpa"]["filename"], "codex@example.com.json")
+
+    def test_run_codex_registration_records_phone_country_cpa_success(self) -> None:
+        from services import codex_register_service
+        from services.register import openai_register
+
+        registrar = mock.Mock()
+        registrar.register.return_value = {
+            "email": "codex@example.com",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "id_token": "id-token",
+            "hero_sms": {"country": 31, "price": 0.05},
+        }
+        pool = {"id": "pool-1", "base_url": "http://localhost:8317", "secret_key": "secret"}
+
+        with (
+            mock.patch.object(codex_register_service, "PlatformRegistrar", return_value=registrar),
+            mock.patch.object(codex_register_service.cpa_config, "list_pools", return_value=[pool]),
+            mock.patch.object(codex_register_service, "build_codex_upload_file", return_value=("codex@example.com.json", b"{}")),
+            mock.patch.object(codex_register_service, "upload_auth_file", return_value={"ok": True}),
+            mock.patch.object(openai_register, "_record_mail_success"),
+            mock.patch.object(openai_register, "step"),
+            mock.patch.object(codex_register_service.country_reputation.store, "record_event") as record_event,
+        ):
+            codex_register_service.run_codex_registration(7)
+
+        record_event.assert_called_once_with(31, "cpa_success", price=0.05, reason="codex_cpa_uploaded")
 
     def test_run_codex_registration_fails_fast_without_cpa_pool(self) -> None:
         from services import codex_register_service

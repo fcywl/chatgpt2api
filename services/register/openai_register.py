@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import random
+import re
 import secrets
 import string
 import threading
@@ -20,6 +21,7 @@ from curl_cffi import requests as curl_requests
 from requests.adapters import HTTPAdapter
 
 from services.account_service import account_service
+from services import hero_sms_country_reputation as country_reputation
 from services.hero_sms_service import HeroSmsClient
 from services.phone_broker_service import mark_country_bad, reserve_phone as resolve_activation
 from services.register import domain_reputation, mail_provider
@@ -28,8 +30,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 base_dir = Path(__file__).resolve().parent
 HERO_SMS_DEFAULT_COUNTRY_POOL = [6, 117, 31, 33, 2, 39, 48, 37, 13, 40, 15, 8, 129, 32, 86, 173, 43, 49, 34, 7, 85, 27, 172, 63, 56, 177, 54, 24, 1, 46, 175, 14, 67, 83, 59, 187, 36]
 HERO_SMS_DEFAULT_COUNTRY_BLACKLIST = [16, 10, 4]
-HERO_SMS_MAX_WAIT_TIMEOUT = 30
+HERO_SMS_MAX_WAIT_TIMEOUT = 45
+HERO_SMS_MIN_WAIT_TIMEOUT = 45
 HERO_SMS_MAX_POLL_INTERVAL = 5
+HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS = 3
 HERO_SMS_CANCEL_RETRY_DELAYS = [95, 180]
 PASSWORD_VERIFY_RETRY_DELAYS = (1.5, 3.0, 6.0, 12.0, 0.0)
 config = {
@@ -55,8 +59,9 @@ config = {
         "reuse_activation_id": "",
         "reuse_phone": "",
         "auto_buy": True,
-        "min_price_usd": 0.0,
-        "max_price_usd": 0.03,
+        "min_price_usd": 0.045,
+        "max_price_usd": 0.1,
+        "send_retry_attempts": HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS,
         "cancel_on_send_fail": True,
     },
 }
@@ -73,8 +78,9 @@ default_hero_sms_config = {
     "reuse_activation_id": "",
     "reuse_phone": "",
     "auto_buy": True,
-    "min_price_usd": 0.0,
-    "max_price_usd": 0.03,
+    "min_price_usd": 0.045,
+    "max_price_usd": 0.1,
+    "send_retry_attempts": HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS,
     "cancel_on_send_fail": True,
 }
 
@@ -107,6 +113,18 @@ print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
+
+
+def redact_sensitive_text(value: object) -> str:
+    text = str(value or "")
+    hero_sms = config.get("hero_sms") if isinstance(config.get("hero_sms"), dict) else {}
+    secrets_to_redact = [str(hero_sms.get("api_key") or "").strip()]
+    for secret in secrets_to_redact:
+        if len(secret) >= 6:
+            text = text.replace(secret, "***")
+    text = re.sub(r"(?i)(api_key=)[^&\s)]+", r"\1***", text)
+    text = re.sub(r"(?i)(Authorization:\s*ApiKey\s+)[^\s,;]+", r"\1***", text)
+    return text
 
 common_headers = {
     "accept": "application/json",
@@ -167,7 +185,6 @@ codex_oauth_profile = {
     "extra_params": {
         "codex_cli_simplified_flow": "true",
         "id_token_add_organizations": "true",
-        "prompt": "login",
         "originator": "codex_cli_rs",
     },
 }
@@ -710,11 +727,43 @@ def _bounded_positive_float(value: object, *, default: float, upper: float) -> f
 
 
 def _hero_sms_wait_timeout(hero_sms: dict) -> float:
-    return _bounded_positive_float(hero_sms.get("wait_timeout"), default=HERO_SMS_MAX_WAIT_TIMEOUT, upper=HERO_SMS_MAX_WAIT_TIMEOUT)
+    return max(
+        HERO_SMS_MIN_WAIT_TIMEOUT,
+        _bounded_positive_float(hero_sms.get("wait_timeout"), default=HERO_SMS_MAX_WAIT_TIMEOUT, upper=HERO_SMS_MAX_WAIT_TIMEOUT),
+    )
 
 
 def _hero_sms_poll_interval(hero_sms: dict) -> float:
     return _bounded_positive_float(hero_sms.get("poll_interval"), default=HERO_SMS_MAX_POLL_INTERVAL, upper=HERO_SMS_MAX_POLL_INTERVAL)
+
+
+def _record_hero_sms_event(activation: Any, event: str, reason: str = "") -> None:
+    try:
+        country_reputation.store.record_event(
+            getattr(activation, "country", None),
+            event,
+            price=getattr(activation, "price", None),
+            reason=redact_sensitive_text(reason),
+        )
+    except Exception:
+        pass
+
+
+def _hero_sms_meta(activation: Any) -> dict:
+    meta: dict[str, Any] = {}
+    try:
+        country = getattr(activation, "country", None)
+        if country is not None:
+            meta["country"] = int(country)
+    except Exception:
+        pass
+    try:
+        price = getattr(activation, "price", None)
+        if price is not None:
+            meta["price"] = float(price)
+    except Exception:
+        pass
+    return meta
 
 
 def _password_verify_retryable(resp) -> bool:
@@ -782,6 +831,24 @@ def _continue_url_from_auth_payload(payload: dict) -> str:
     }
     path = page_paths.get(page_type)
     return f"{auth_base}{path}" if path else ""
+
+
+def _auth_response_hint(resp) -> str:
+    data = _response_json(resp)
+    page_type = str(((data.get("page") or {}).get("type")) or "").strip()
+    continue_url = _continue_url_from_auth_payload(data)
+    location = str((getattr(resp, "headers", {}) or {}).get("Location") or "").strip()
+    url = str(getattr(resp, "url", "") or "").strip()
+    parts = [f"status={getattr(resp, 'status_code', '-') }"]
+    if page_type:
+        parts.append(f"page_type={page_type}")
+    if continue_url:
+        parsed = urlparse(continue_url)
+        parts.append(f"continue={parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.scheme and parsed.netloc else f"continue={continue_url[:120]}")
+    if location:
+        parsed = urlparse(urljoin(url or auth_base, location))
+        parts.append(f"location={parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.scheme and parsed.netloc else f"location={location[:120]}")
+    return ", ".join(parts)
 
 
 def exchange_oauth_callback_params(code_verifier: str, callback_params: dict[str, str], profile: dict | None = None) -> dict | None:
@@ -947,19 +1014,24 @@ class PlatformRegistrar:
             "HeroSMS 开始买号: "
             f"service={hero_sms.get('service') or 'dr'}, "
             f"min_price_usd={hero_sms.get('min_price_usd') or 0}, "
-            f"max_price_usd={hero_sms.get('max_price_usd') or 0.03}, "
+            f"max_price_usd={hero_sms.get('max_price_usd') or 0.1}, "
             f"pool_head={(country_pool or [hero_sms.get('country') or 6])[:8]}, "
             f"blacklist={country_blacklist}",
         )
         try:
-            send_retry_attempts = int(hero_sms.get("send_retry_attempts") or 5)
+            send_retry_attempts = int(hero_sms.get("send_retry_attempts") or HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS)
         except Exception:
-            send_retry_attempts = 5
+            send_retry_attempts = HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS
         send_retry_attempts = max(1, min(8, send_retry_attempts))
         last_send_error = ""
+        attempted_countries: set[int] = set()
 
         for send_attempt in range(1, send_retry_attempts + 1):
-            activation = resolve_activation(hero_sms, on_event=lambda message: step(index, message))
+            activation_config = dict(hero_sms)
+            if attempted_countries:
+                base_blacklist = hero_sms.get("country_blacklist") if isinstance(hero_sms.get("country_blacklist"), list) else []
+                activation_config["country_blacklist"] = list(dict.fromkeys([*base_blacklist, *sorted(attempted_countries)]))
+            activation = resolve_activation(activation_config, on_event=lambda message: step(index, message))
             phone_number = _e164_phone(str(activation.phone or ""))
             country_note = f", country={activation.country}" if getattr(activation, "country", None) else ""
             step(index, f"add_phone 使用 HeroSMS activation={activation.activation_id}{country_note}, phone=***{phone_number[-4:]}")
@@ -978,7 +1050,11 @@ class PlatformRegistrar:
                     _schedule_hero_sms_cancel_retry(api_key, str(activation.activation_id), reason, index, hero_sms)
 
             try:
-                activation_status = client.get_status(str(activation.activation_id))
+                try:
+                    activation_status = client.get_status(str(activation.activation_id))
+                except Exception as exc:
+                    activation_status = "STATUS_WAIT_CODE"
+                    step(index, f"HeroSMS activation 状态预检失败，继续发送验证码: {redact_sensitive_text(exc)}", "yellow")
                 if activation_status not in {"STATUS_WAIT_CODE", "STATUS_WAIT_RETRY", "STATUS_WAIT_RESEND"}:
                     raise RuntimeError(f"HeroSMS activation 不可用: {activation_status}")
                 send_resp, error = request_with_local_retry(
@@ -995,14 +1071,21 @@ class PlatformRegistrar:
                     data = _response_json(send_resp) if send_resp is not None else {}
                     code_text = str(((data.get("error") or {}).get("code") if isinstance(data, dict) else "") or "").strip()
                     retryable_send_error = code_text in {"phone_number_in_use", "fraud_guard"}
-                    mark_country_bad(getattr(activation, "country", None), f"add_phone_send_failed:{code_text or 'unknown'}")
+                    if code_text == "fraud_guard":
+                        mark_country_bad(getattr(activation, "country", None), f"add_phone_send_failed:{code_text or 'unknown'}")
+                    _record_hero_sms_event(activation, code_text if code_text in {"phone_number_in_use", "fraud_guard"} else "send_fail", f"add_phone_send_failed:{code_text or 'unknown'}")
                     cancel_activation("add_phone_send 失败")
                     last_send_error = error or f"add_phone_send_http_{getattr(send_resp, 'status_code', 'unknown')}{_response_error_detail(send_resp)}"
                     if retryable_send_error and send_attempt < send_retry_attempts:
+                        try:
+                            attempted_countries.add(int(getattr(activation, "country", 0) or 0))
+                        except Exception:
+                            pass
                         step(index, f"add_phone_send 可换号重试: {code_text}，attempt={send_attempt}/{send_retry_attempts}", "yellow")
                         continue
                     raise RuntimeError(last_send_error)
                 phone_verify_url = _continue_url_from_auth_payload(_response_json(send_resp)) or f"{auth_base}/phone-verification"
+                _record_hero_sms_event(activation, "send_ok")
                 step(index, "add_phone 发送验证码完成")
 
                 nav_resp, error = request_with_local_retry(
@@ -1024,12 +1107,17 @@ class PlatformRegistrar:
                 except Exception as exc:
                     sms_timeout = "sms_code_timeout" in str(exc)
                     if sms_timeout:
-                        mark_country_bad(getattr(activation, "country", None), "sms_code_timeout")
+                        _record_hero_sms_event(activation, "sms_code_timeout", str(exc))
                     cancel_activation("等待 HeroSMS 验证码失败")
                     if sms_timeout and send_attempt < send_retry_attempts:
+                        try:
+                            attempted_countries.add(int(getattr(activation, "country", 0) or 0))
+                        except Exception:
+                            pass
                         step(index, f"HeroSMS 收码超时，换号重试 attempt={send_attempt}/{send_retry_attempts}", "yellow")
                         continue
                     raise
+                _record_hero_sms_event(activation, "sms_ok")
                 step(index, f"HeroSMS 收到 add_phone 验证码: {code}")
                 verify_resp, error = request_with_local_retry(
                     self.session,
@@ -1042,6 +1130,7 @@ class PlatformRegistrar:
                     retry_statuses=(429, 500, 502, 503, 504),
                 )
                 if verify_resp is None or verify_resp.status_code != 200:
+                    _record_hero_sms_event(activation, "phone_otp_validate_fail", _response_error_detail(verify_resp) or error)
                     raise RuntimeError(error or f"phone_otp_validate_http_{getattr(verify_resp, 'status_code', 'unknown')}{_response_error_detail(verify_resp)}")
                 next_url = _continue_url_from_auth_payload(_response_json(verify_resp))
                 if not next_url:
@@ -1050,6 +1139,8 @@ class PlatformRegistrar:
                     client.finish(str(activation.activation_id))
                 except Exception as exc:
                     step(index, f"HeroSMS finish 失败: {exc}", "yellow")
+                _record_hero_sms_event(activation, "add_phone_success")
+                self._last_hero_sms = _hero_sms_meta(activation)
                 step(index, "add_phone 验证完成")
                 return next_url
             finally:
@@ -1059,11 +1150,11 @@ class PlatformRegistrar:
                     pass
         raise RuntimeError(last_send_error or "add_phone_send_failed")
 
-    def _platform_authorize(self, email: str, index: int) -> None:
+    def _platform_authorize(self, email: str, index: int) -> str:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-        _, code_challenge = _generate_pkce()
+        code_verifier, code_challenge = _generate_pkce()
         resp, error = request_with_local_retry(
             self.session,
             "get",
@@ -1079,6 +1170,7 @@ class PlatformRegistrar:
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "platform authorize 完成")
+        return code_verifier
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -1091,6 +1183,7 @@ class PlatformRegistrar:
                 step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+        step(index, f"提交注册密码响应: {_auth_response_hint(resp)}")
         step(index, "提交注册密码完成")
 
     def _send_otp(self, index: int) -> None:
@@ -1105,9 +1198,10 @@ class PlatformRegistrar:
         resp, error = validate_otp(self.session, self.device_id, code)
         if resp is None or resp.status_code != 200:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        step(index, f"验证码校验响应: {_auth_response_hint(resp)}")
         step(index, "验证码校验完成")
 
-    def _create_account(self, name: str, birthdate: str, index: int) -> None:
+    def _create_account(self, name: str, birthdate: str, index: int) -> str:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
@@ -1118,7 +1212,20 @@ class PlatformRegistrar:
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+        step(index, f"创建账号资料响应: {_auth_response_hint(resp)}")
         step(index, "创建账号资料完成")
+        return _continue_url_from_auth_payload(_response_json(resp))
+
+    def _tokens_from_create_account_callback(self, code_verifier: str, continue_url: str, index: int) -> dict | None:
+        callback_params = extract_oauth_callback_params_from_url(continue_url)
+        if not callback_params:
+            return None
+        tokens = exchange_oauth_callback_params(code_verifier, callback_params)
+        if tokens:
+            step(index, "创建账号资料已返回 OAuth code，跳过独立登录")
+            return tokens
+        step(index, "创建账号资料返回 OAuth code，但 token 换取失败，回退独立登录", "yellow")
+        return None
 
     def _login_and_exchange_tokens(self, email: str, password: str, mailbox: dict, index: int, profile: dict | None = None) -> dict:
         step(index, "开始独立登录换 token")
@@ -1251,7 +1358,7 @@ class PlatformRegistrar:
             step(index, f"邮箱创建完成: {email}")
             password = _random_password()
             first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
+            platform_code_verifier = self._platform_authorize(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
@@ -1260,9 +1367,13 @@ class PlatformRegistrar:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-            tokens = self._login_and_exchange_tokens(email, password, mailbox, index, profile=profile)
-            return {
+            create_account_continue_url = self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            tokens = None
+            if _oauth_profile(profile).get("kind") == "platform":
+                tokens = self._tokens_from_create_account_callback(platform_code_verifier, create_account_continue_url, index)
+            if not tokens:
+                tokens = self._login_and_exchange_tokens(email, password, mailbox, index, profile=profile)
+            result = {
                 "email": email,
                 "password": password,
                 "access_token": str(tokens.get("access_token") or "").strip(),
@@ -1273,6 +1384,10 @@ class PlatformRegistrar:
                 "mail_domain": str(mailbox.get("domain") or (email.rsplit("@", 1)[-1] if "@" in email else "")).strip().lower(),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+            hero_sms_meta = getattr(self, "_last_hero_sms", None)
+            if isinstance(hero_sms_meta, dict) and hero_sms_meta:
+                result["hero_sms"] = hero_sms_meta
+            return result
         except RegisterAttemptError:
             raise
         except Exception as exc:

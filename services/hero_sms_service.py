@@ -8,6 +8,7 @@ import requests
 
 
 HERO_SMS_HANDLER_URL = "https://hero-sms.com/stubs/handler_api.php"
+HERO_SMS_API_URL = "https://hero-sms.com/api/v1"
 OPENAI_SERVICE_CODE = "dr"
 
 
@@ -23,6 +24,7 @@ class HeroSmsActivation:
     country: int | str | None = None
     service: str = OPENAI_SERVICE_CODE
     operator: str = "any"
+    price: float | None = None
 
 
 class HeroSmsClient:
@@ -126,6 +128,29 @@ class HeroSmsClient:
         if title:
             raise HeroSmsError(f"{title}{': ' + details if details else ''}")
         return data
+
+    def get_activation_offers(self, *, service: str = OPENAI_SERVICE_CODE, countries: list[int] | None = None) -> dict:
+        params = {"services": service}
+        if countries:
+            params["countries"] = ",".join(str(int(country)) for country in countries if int(country) > 0)
+        response = self.session.get(
+            f"{HERO_SMS_API_URL}/activations/offers",
+            params=params,
+            headers={"Authorization": f"ApiKey {self.api_key}"},
+            timeout=self.timeout,
+        )
+        data = self._json_response(response)
+        if not data:
+            text = str(getattr(response, "text", "") or "").strip()
+            if getattr(response, "ok", True) is False or self._is_error_text(text):
+                raise HeroSmsError(text or f"HTTP {getattr(response, 'status_code', 'unknown')}")
+            raise HeroSmsError(text or "get_activation_offers returned empty response")
+        title = str(data.get("title") or data.get("error") or data.get("message") or "").strip()
+        details = str(data.get("details") or "").strip()
+        if title:
+            raise HeroSmsError(f"{title}{': ' + details if details else ''}")
+        offers = data.get("data")
+        return offers if isinstance(offers, dict) else data
 
     def get_status(self, activation_id: str) -> str:
         return self._request("getStatus", id=str(activation_id or "").strip())

@@ -139,8 +139,8 @@ function normalizeRegisterHeroSmsForSave(heroSms: RegisterConfig["hero_sms"]): R
     : DEFAULT_HERO_SMS_COUNTRY_POOL;
   const filteredCountryPool = Array.from(new Set(countryPool)).filter((item) => !blacklist.includes(item));
   const finalCountryPool = filteredCountryPool.length > 0 ? filteredCountryPool : DEFAULT_HERO_SMS_COUNTRY_POOL.filter((item) => !blacklist.includes(item));
-  const maxPriceUsd = Math.max(0.001, Number(heroSms.max_price_usd) || 0.03);
-  const minPriceUsd = Math.min(maxPriceUsd, Math.max(0, Number(heroSms.min_price_usd) || 0));
+  const maxPriceUsd = Math.max(0.001, Number(heroSms.max_price_usd) || 0.1);
+  const minPriceUsd = Math.min(maxPriceUsd, Math.max(0, Number(heroSms.min_price_usd) || 0.045));
 
   return {
     ...heroSms,
@@ -149,7 +149,7 @@ function normalizeRegisterHeroSmsForSave(heroSms: RegisterConfig["hero_sms"]): R
     country_pool: finalCountryPool,
     country_blacklist: blacklist,
     operator: "any",
-    wait_timeout: Math.min(30, Math.max(1, Number(heroSms.wait_timeout) || 30)),
+    wait_timeout: Math.min(45, Math.max(1, Number(heroSms.wait_timeout) || 45)),
     poll_interval: Math.min(5, Math.max(1, Number(heroSms.poll_interval) || 5)),
     reuse_activation_id: "",
     reuse_phone: "",

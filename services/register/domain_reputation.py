@@ -28,6 +28,45 @@ SOFT_FAILURE_MARKERS = (
     "oauth_token_exchange_failed",
 )
 
+SOFT_FAIL_SCORE_PENALTY = 120
+CONSECUTIVE_FAIL_SCORE_PENALTY = 500
+HARD_FAIL_SCORE_PENALTY = 2000
+CONSECUTIVE_FAIL_SKIP_THRESHOLD = 3
+
+
+def _stats(record: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        int(record.get("success") or 0),
+        int(record.get("hard_fail") or 0),
+        int(record.get("soft_fail") or 0),
+        int(record.get("consecutive_fail") or 0),
+    )
+
+
+def _score(record: dict[str, Any]) -> int:
+    success, hard_fail, soft_fail, consecutive_fail = _stats(record)
+    return (
+        success * 100
+        - hard_fail * HARD_FAIL_SCORE_PENALTY
+        - soft_fail * SOFT_FAIL_SCORE_PENALTY
+        - consecutive_fail * CONSECUTIVE_FAIL_SCORE_PENALTY
+    )
+
+
+def _healthy(record: dict[str, Any]) -> bool:
+    if bool(record.get("disabled")):
+        return False
+    success, hard_fail, soft_fail, consecutive_fail = _stats(record)
+    if hard_fail:
+        return False
+    if consecutive_fail >= CONSECUTIVE_FAIL_SKIP_THRESHOLD:
+        return False
+    if success > 0 and soft_fail > success:
+        return False
+    if success == 0 and soft_fail > 0:
+        return False
+    return True
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -156,16 +195,33 @@ class DomainReputationStore:
                 record = records.get(domain) or {}
                 if bool(record.get("disabled")):
                     continue
-                success = int(record.get("success") or 0)
-                hard_fail = int(record.get("hard_fail") or 0)
-                soft_fail = int(record.get("soft_fail") or 0)
-                consecutive_fail = int(record.get("consecutive_fail") or 0)
-                score = success * 100 - hard_fail * 1000 - soft_fail * 10 - consecutive_fail * 20
-                scored.append((score, domain))
+                scored.append((_score(record), domain))
             if not scored:
                 return []
+            healthy = [(score, domain) for score, domain in scored if _healthy(records.get(domain) or {})]
+            if healthy:
+                scored = healthy
             best = max(score for score, _ in scored)
             return [domain for score, domain in scored if score == best]
+
+    def usable_domains(self, provider: str, domains: list[str]) -> list[str]:
+        normalized = _domains(domains)
+        if not normalized:
+            return []
+        with self._lock:
+            data = self._load_locked()
+            records = (((data.get("providers") or {}).get(str(provider or "unknown")) or {}).get("domains") or {})
+            scored: list[tuple[int, str]] = []
+            for domain in normalized:
+                record = records.get(domain) or {}
+                if bool(record.get("disabled")):
+                    continue
+                scored.append((_score(record), domain))
+            if not scored:
+                return []
+            healthy = [(score, domain) for score, domain in scored if _healthy(records.get(domain) or {})]
+            candidates = healthy or scored
+            return [domain for _, domain in sorted(candidates, key=lambda item: (-item[0], item[1]))]
 
     def good_domains(self, provider: str) -> list[str]:
         with self._lock:
@@ -175,9 +231,9 @@ class DomainReputationStore:
             for domain, record in domains.items():
                 if not isinstance(record, dict) or bool(record.get("disabled")):
                     continue
-                if int(record.get("success") or 0) <= 0:
+                if int(record.get("success") or 0) <= 0 or not _healthy(record):
                     continue
-                items.append((int(record.get("success") or 0), str(domain)))
+                items.append((_score(record), str(domain)))
             return [domain for _, domain in sorted(items, key=lambda item: (-item[0], item[1]))]
 
 

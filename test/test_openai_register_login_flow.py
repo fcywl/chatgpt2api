@@ -32,6 +32,15 @@ class FakeSession:
 
 
 class OpenAIRegisterLoginFlowTests(unittest.TestCase):
+    def test_redact_sensitive_text_removes_hero_sms_api_key_from_urls(self):
+        with mock.patch.dict(openai_register.config, {"hero_sms": {"api_key": "hero-secret-key"}}):
+            redacted = openai_register.redact_sensitive_text(
+                "HTTPSConnectionPool(url=/handler_api.php?api_key=hero-secret-key&action=getStatus)"
+            )
+
+        self.assertNotIn("hero-secret-key", redacted)
+        self.assertIn("api_key=***", redacted)
+
     def test_extract_oauth_callback_params_from_response_uses_redirect_history_location(self):
         response = FakeResponse(
             url="https://auth.openai.com/authorize/done",
@@ -278,6 +287,7 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         self.assertIn("codex_cli_simplified_flow=true", authorize_calls[0][1])
         self.assertIn("id_token_add_organizations=true", authorize_calls[0][1])
         self.assertIn("originator=codex_cli_rs", authorize_calls[0][1])
+        self.assertNotIn("prompt=login", authorize_calls[0][1])
         self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback", authorize_calls[0][1])
         exchange.assert_called_once()
 
@@ -628,7 +638,7 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         self.assertEqual(continue_url, "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
         self.assertEqual(session.sent_phone, "+84816062294")
         self.assertEqual(session.validated_code, "123456")
-        self.assertEqual(FakeHeroClient.instances[0].polled, ("387542069", 30.0))
+        self.assertEqual(FakeHeroClient.instances[0].polled, ("387542069", 45.0))
         self.assertEqual(FakeHeroClient.instances[0].finished, ["387542069"])
 
     def test_codex_add_phone_rejects_cancelled_hero_sms_activation_before_send(self):
@@ -667,6 +677,61 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "HeroSMS activation 不可用"):
                 registrar._handle_codex_add_phone("https://auth.openai.com/add-phone", 1)
+
+    def test_codex_add_phone_continues_when_hero_sms_status_precheck_is_transient(self):
+        class AddPhoneSession:
+            def request(self, method, url, **kwargs):
+                if "/api/accounts/add-phone/send" in url:
+                    return FakeResponse(
+                        status_code=200,
+                        json_data={"continue_url": "https://auth.openai.com/phone-verification"},
+                        url=url,
+                    )
+                if url == "https://auth.openai.com/phone-verification":
+                    return FakeResponse(status_code=200, url=url)
+                if "/api/accounts/phone-otp/validate" in url:
+                    return FakeResponse(
+                        status_code=200,
+                        json_data={"page": {"type": "sign_in_with_chatgpt_codex_consent"}},
+                        url=url,
+                    )
+                raise AssertionError(f"unexpected request {method} {url}")
+
+        class TransientStatusHeroClient:
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                self.finished = []
+                TransientStatusHeroClient.instances.append(self)
+
+            def get_status(self, activation_id):
+                raise openai_register.requests.exceptions.SSLError("unexpected eof")
+
+            def poll_code(self, activation_id, *, timeout):
+                return "123456"
+
+            def finish(self, activation_id):
+                self.finished.append(activation_id)
+
+            def close(self):
+                pass
+
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = AddPhoneSession()
+        registrar.device_id = "device-1"
+        hero_config = {"enabled": True, "api_key": "hero-key", "wait_timeout": 45, "poll_interval": 1}
+        activation = mock.Mock(activation_id="ok", phone="10001", raw="ACCESS_NUMBER:ok:10001", country=31)
+
+        with (
+            mock.patch.dict(openai_register.config, {"hero_sms": hero_config}),
+            mock.patch.object(openai_register, "resolve_activation", return_value=activation),
+            mock.patch.object(openai_register, "HeroSmsClient", TransientStatusHeroClient),
+            mock.patch.object(openai_register, "step"),
+        ):
+            continue_url = registrar._handle_codex_add_phone("https://auth.openai.com/add-phone", 1)
+
+        self.assertEqual(continue_url, "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        self.assertEqual(TransientStatusHeroClient.instances[0].finished, ["ok"])
 
     def test_codex_add_phone_cancels_auto_bought_number_when_send_fails(self):
         class SendFailSession:
@@ -785,7 +850,7 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
 
         with (
             mock.patch.dict(openai_register.config, {"hero_sms": hero_config}),
-            mock.patch.object(openai_register, "resolve_activation", side_effect=activations),
+            mock.patch.object(openai_register, "resolve_activation", side_effect=activations) as resolve,
             mock.patch.object(openai_register, "HeroSmsClient", HeroClientWithCancelAndCode),
             mock.patch.object(openai_register, "mark_country_bad") as mark_bad,
             mock.patch.object(openai_register, "step"),
@@ -795,7 +860,8 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         self.assertEqual(continue_url, "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
         self.assertEqual(session.sent_phones, ["+10001", "+10002"])
         self.assertEqual(HeroClientWithCancelAndCode.instances[0].cancelled, ["old"])
-        mark_bad.assert_called_with(6, "add_phone_send_failed:phone_number_in_use")
+        mark_bad.assert_not_called()
+        self.assertIn(6, resolve.call_args_list[1].args[0]["country_blacklist"])
 
     def test_codex_add_phone_retries_new_number_when_sms_times_out(self):
         class RetrySmsSession:
@@ -864,7 +930,7 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
 
         with (
             mock.patch.dict(openai_register.config, {"hero_sms": hero_config}),
-            mock.patch.object(openai_register, "resolve_activation", side_effect=activations),
+            mock.patch.object(openai_register, "resolve_activation", side_effect=activations) as resolve,
             mock.patch.object(openai_register, "HeroSmsClient", HeroClientWithTimeoutThenCode),
             mock.patch.object(openai_register, "mark_country_bad") as mark_bad,
             mock.patch.object(openai_register, "step"),
@@ -875,7 +941,8 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         self.assertEqual(session.sent_phones, ["+10001", "+10002"])
         self.assertEqual(HeroClientWithTimeoutThenCode.instances[0].cancelled, ["old"])
         self.assertEqual(HeroClientWithTimeoutThenCode.instances[1].finished, "new")
-        mark_bad.assert_called_with(6, "sms_code_timeout")
+        mark_bad.assert_not_called()
+        self.assertIn(6, resolve.call_args_list[1].args[0]["country_blacklist"])
 
     def test_codex_add_phone_caps_wait_timeout_and_cancels_when_sms_never_arrives(self):
         class SendOkSession:
@@ -935,8 +1002,11 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "sms_code_timeout"):
                 registrar._handle_codex_add_phone("https://auth.openai.com/add-phone", 1)
 
-        self.assertEqual(SlowHeroClient.instances[0].polled, ("387677529", 30.0))
+        self.assertEqual(SlowHeroClient.instances[0].polled, ("387677529", 45.0))
         self.assertEqual(SlowHeroClient.instances[0].cancelled, ["387677529"])
+
+    def test_hero_sms_wait_timeout_has_effective_floor(self):
+        self.assertEqual(openai_register._hero_sms_wait_timeout({"wait_timeout": 30}), 45.0)
 
     def test_codex_add_phone_schedules_retry_when_provider_denies_early_cancel(self):
         class SendOkSession:
@@ -1023,6 +1093,37 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         self.assertEqual(result["email"], "user@example.com")
         login.assert_called_once()
         self.assertIs(login.call_args.kwargs["profile"], openai_register.codex_oauth_profile)
+
+    def test_register_uses_create_account_callback_without_independent_login(self):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = mock.Mock()
+        registrar.device_id = "device-1"
+        tokens = {"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
+
+        with (
+            mock.patch.object(openai_register, "create_mailbox", return_value={"address": "user@example.com", "provider": "fake"}),
+            mock.patch.object(openai_register, "wait_for_code", return_value="123456"),
+            mock.patch.object(openai_register, "_random_password", return_value="Password1!"),
+            mock.patch.object(openai_register, "_random_name", return_value=("Test", "User")),
+            mock.patch.object(openai_register, "_random_birthdate", return_value="2000-01-01"),
+            mock.patch.object(openai_register.PlatformRegistrar, "_platform_authorize", return_value="verifier"),
+            mock.patch.object(openai_register.PlatformRegistrar, "_register_user"),
+            mock.patch.object(openai_register.PlatformRegistrar, "_send_otp"),
+            mock.patch.object(openai_register.PlatformRegistrar, "_validate_otp"),
+            mock.patch.object(
+                openai_register.PlatformRegistrar,
+                "_create_account",
+                return_value="https://platform.openai.com/auth/callback?code=abc123&state=st&scope=openid",
+            ),
+            mock.patch.object(openai_register, "exchange_oauth_callback_params", return_value=tokens) as exchange,
+            mock.patch.object(openai_register.PlatformRegistrar, "_login_and_exchange_tokens") as login,
+            mock.patch.object(openai_register, "step"),
+        ):
+            result = registrar.register(1)
+
+        self.assertEqual(result["access_token"], "access")
+        exchange.assert_called_once_with("verifier", {"code": "abc123", "state": "st", "scope": "openid"})
+        login.assert_not_called()
 
     def test_request_with_local_retry_retries_transient_http_status(self):
         class RetrySession:

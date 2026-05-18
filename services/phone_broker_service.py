@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from services import hero_sms_country_reputation as country_reputation
 from services.hero_sms_service import OPENAI_SERVICE_CODE, HeroSmsActivation, HeroSmsClient, HeroSmsError
 
 
@@ -29,6 +30,8 @@ class _PhoneCandidate:
     operator: str
     price: float | None = None
     count: int | None = None
+    physical_count: int | None = None
+    provider_rank: int = 999
 
 
 def _positive_float(value: object, default: float) -> float:
@@ -124,6 +127,12 @@ def _parse_count(value: object) -> int:
     return parsed if parsed > 0 else 0
 
 
+def _parse_physical_count(info: dict, fallback_count: int) -> int:
+    if "physicalCount" in info:
+        return _parse_count(info.get("physicalCount"))
+    return fallback_count
+
+
 def _priced_candidates(
     prices: dict,
     countries: list[int],
@@ -150,12 +159,91 @@ def _priced_candidates(
                 continue
             price = _parse_price(info.get("cost"))
             count = _parse_count(info.get("count"))
+            physical_count = _parse_physical_count(info, count)
             if price is None or count <= 0:
                 continue
+            if physical_count <= 0:
+                continue
             if min_price <= price <= max_price:
-                candidates.append(_PhoneCandidate(country=country, operator=wanted_operator, price=price, count=count))
-    candidates.sort(key=lambda item: (order[item.country], item.price if item.price is not None else 999, -int(item.count or 0)))
+                candidates.append(
+                    _PhoneCandidate(
+                        country=country,
+                        operator=wanted_operator,
+                        price=price,
+                        count=count,
+                        physical_count=physical_count,
+                        provider_rank=order[country],
+                    )
+                )
     return candidates
+
+
+def _offer_candidates(
+    offers: dict,
+    countries: list[int],
+    *,
+    operator: str,
+    min_price: float,
+    max_price: float,
+    service: str,
+) -> list[_PhoneCandidate]:
+    service_offers = offers.get(service) if isinstance(offers.get(service), dict) else offers
+    if not isinstance(service_offers, dict):
+        return []
+    order = {country: index for index, country in enumerate(countries)}
+    wanted_operator = str(operator or "any").strip() or "any"
+    candidates: list[_PhoneCandidate] = []
+    for provider_rank, (raw_country, info) in enumerate(service_offers.items()):
+        try:
+            country = int(raw_country)
+        except Exception:
+            continue
+        if country not in order or not isinstance(info, dict):
+            continue
+        prices = info.get("prices") if isinstance(info.get("prices"), dict) else {}
+        counts = info.get("counts") if isinstance(info.get("counts"), dict) else {}
+        price = _parse_price(prices.get("default") if "default" in prices else prices.get("min"))
+        count = _parse_count(counts.get("defaultPrice") if counts.get("defaultPrice") is not None else counts.get("total"))
+        physical_count = _parse_count(counts.get("physical") if counts.get("physical") is not None else count)
+        if price is None or count <= 0 or physical_count <= 0:
+            continue
+        if min_price <= price <= max_price:
+            candidates.append(
+                _PhoneCandidate(
+                    country=country,
+                    operator=wanted_operator,
+                    price=price,
+                    count=count,
+                    physical_count=physical_count,
+                    provider_rank=provider_rank,
+                )
+            )
+    return candidates
+
+
+def _rank_priced_candidates(candidates: list[_PhoneCandidate]) -> list[_PhoneCandidate]:
+    rank_input = [
+        country_reputation.CountryCandidate(
+            country=item.country,
+            price=float(item.price or 0),
+            count=int(item.count or 0),
+            physical_count=int(item.physical_count or item.count or 0),
+            provider_rank=int(item.provider_rank or 999),
+        )
+        for item in candidates
+        if item.price is not None
+    ]
+    ranked = country_reputation.store.rank_candidates(rank_input)
+    rank_by_country = {item.country: index for index, item in enumerate(ranked)}
+    return sorted(
+        candidates,
+        key=lambda item: (
+            rank_by_country.get(item.country, 9999),
+            item.price if item.price is not None else 999,
+            item.provider_rank,
+            -int(item.physical_count or 0),
+        ),
+    )
 
 
 def _candidate_pool(
@@ -172,18 +260,29 @@ def _candidate_pool(
     if min_price <= 0:
         return [_PhoneCandidate(country=country, operator=operator) for country in countries]
 
+    candidates: list[_PhoneCandidate] = []
     try:
-        prices = client.get_prices(service=service)
+        offers = client.get_activation_offers(service=service, countries=countries)
+        if isinstance(offers, dict):
+            candidates = _offer_candidates(offers, countries, operator=operator, min_price=min_price, max_price=max_price, service=service)
     except Exception as exc:
-        raise RuntimeError(f"HeroSMS 价格表获取失败，已阻止低价盲买: {exc}") from exc
+        emit(f"HeroSMS offers 获取失败，回退 getPrices: {exc}")
 
-    candidates = _priced_candidates(prices, countries, operator=operator, min_price=min_price, max_price=max_price)
+    if not candidates:
+        try:
+            prices = client.get_prices(service=service)
+        except Exception as exc:
+            raise RuntimeError(f"HeroSMS 价格表获取失败，已阻止低价盲买: {exc}") from exc
+        candidates = _priced_candidates(prices, countries, operator=operator, min_price=min_price, max_price=max_price)
     if not candidates:
         raise RuntimeError(f"HeroSMS 无符合价格区间的号码: min_price_usd={min_price}, max_price_usd={max_price}")
+    candidates = _rank_priced_candidates(candidates)
     preview = ", ".join(
-        f"{item.country}/{item.operator}/${item.price:.4f}/stock={item.count}" for item in candidates[:8] if item.price is not None
+        f"{item.country}/{item.operator}/${item.price:.4f}/stock={item.count}/physical={item.physical_count}/rank={item.provider_rank}"
+        for item in candidates[:8]
+        if item.price is not None
     )
-    emit(f"HeroSMS 价格过滤命中 {len(candidates)} 个候选: {preview}")
+    emit(f"HeroSMS 价格过滤命中 {len(candidates)} 个候选，已按成本排序: {preview}")
     return candidates
 
 
@@ -233,12 +332,14 @@ def reserve_phone(config: dict, *, session: Any | None = None, on_event=None) ->
                     f"HeroSMS getNumber 尝试: country={candidate.country}, operator={candidate.operator}, "
                     f"max_price_usd={max_price}"
                 )
-                return client.get_number(
+                activation = client.get_number(
                     service=service,
                     country=candidate.country,
                     operator=candidate.operator,
                     max_price=max_price,
                 )
+                country_reputation.store.record_event(candidate.country, "bought", price=candidate.price)
+                return replace(activation, country=candidate.country, operator=candidate.operator, price=candidate.price)
             except HeroSmsError as exc:
                 errors.append(f"{candidate.country}/{candidate.operator}:{exc}")
                 if not _can_try_next_country(exc):

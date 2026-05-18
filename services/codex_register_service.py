@@ -5,6 +5,7 @@ import time
 from services.codex_cpa_service import build_codex_upload_file
 from services.cpa_push_service import upload_auth_file
 from services.cpa_service import cpa_config
+from services import hero_sms_country_reputation as country_reputation
 from services.register import openai_register
 from services.register.openai_register import PlatformRegistrar
 
@@ -36,6 +37,14 @@ def run_codex_registration(index: int, *, pool: dict | None = None) -> dict:
 
         filename, body = build_codex_upload_file(_codex_tokens(result))
         upload_auth_file(pool, filename, body)
+        hero_sms = result.get("hero_sms") if isinstance(result.get("hero_sms"), dict) else {}
+        if hero_sms:
+            country_reputation.store.record_event(
+                hero_sms.get("country"),
+                "cpa_success",
+                price=hero_sms.get("price"),
+                reason="codex_cpa_uploaded",
+            )
         cost = time.time() - start
         openai_register.step(index, f"Codex CPA 上传完成: pool={pool.get('id')}, file={filename}, 耗时{cost:.1f}s", "green")
         return {

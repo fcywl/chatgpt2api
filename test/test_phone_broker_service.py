@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -142,6 +144,72 @@ class PhoneBrokerServiceTests(unittest.TestCase):
                 )
 
         fake_client.get_number.assert_not_called()
+
+    def test_reserve_prefers_learned_successful_country_under_budget(self) -> None:
+        from services import hero_sms_country_reputation, phone_broker_service
+        from services.hero_sms_service import HeroSmsActivation
+        from services.phone_broker_service import reserve_phone
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = hero_sms_country_reputation.CountryReputationStore(Path(temp_dir) / "hero_sms_country_reputation.json")
+            store.record_event(33, "fraud_guard", price=0.05)
+            store.record_event(31, "cpa_success", price=0.05)
+            fake_client = mock.Mock()
+            fake_client.get_activation_offers.return_value = {
+                "dr": {
+                    "33": {"prices": {"default": 0.05}, "counts": {"total": 9000, "physical": 1500}},
+                    "31": {"prices": {"default": 0.05}, "counts": {"total": 3500, "physical": 3400}},
+                    "48": {"prices": {"default": 0.075}, "counts": {"total": 2900, "physical": 1100}},
+                }
+            }
+            fake_client.get_number.return_value = HeroSmsActivation("31-ok", "10031", "ACCESS_NUMBER:31-ok:10031", country=31)
+
+            with (
+                mock.patch("services.phone_broker_service.HeroSmsClient", return_value=fake_client),
+                mock.patch.object(phone_broker_service.country_reputation, "store", store),
+            ):
+                activation = reserve_phone(
+                    {
+                        "api_key": "hero-key",
+                        "service": "dr",
+                        "operator": "any",
+                        "country_pool": [33, 31, 48],
+                        "min_price_usd": 0.045,
+                        "max_price_usd": 0.1,
+                    }
+                )
+
+        self.assertEqual(activation.country, 31)
+        self.assertEqual(activation.price, 0.05)
+        fake_client.get_number.assert_called_once_with(service="dr", country=31, operator="any", max_price=0.1)
+
+    def test_reserve_avoids_zero_physical_stock_when_priced_candidates_exist(self) -> None:
+        from services.hero_sms_service import HeroSmsActivation
+        from services.phone_broker_service import reserve_phone
+
+        fake_client = mock.Mock()
+        fake_client.get_activation_offers.return_value = {
+            "dr": {
+                "54": {"prices": {"default": 0.1}, "counts": {"total": 800, "physical": 0}},
+                "40": {"prices": {"default": 0.09}, "counts": {"total": 3200, "physical": 2900}},
+            }
+        }
+        fake_client.get_number.return_value = HeroSmsActivation("40-ok", "10040", "ACCESS_NUMBER:40-ok:10040", country=40)
+
+        with mock.patch("services.phone_broker_service.HeroSmsClient", return_value=fake_client):
+            activation = reserve_phone(
+                {
+                    "api_key": "hero-key",
+                    "service": "dr",
+                    "operator": "any",
+                    "country_pool": [54, 40],
+                    "min_price_usd": 0.045,
+                    "max_price_usd": 0.1,
+                }
+            )
+
+        self.assertEqual(activation.country, 40)
+        fake_client.get_number.assert_called_once_with(service="dr", country=40, operator="any", max_price=0.1)
 
 
 if __name__ == "__main__":

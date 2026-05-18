@@ -15,7 +15,10 @@ from services.register import openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
-HERO_SMS_MAX_WAIT_TIMEOUT = 30
+HERO_SMS_MAX_WAIT_TIMEOUT = 45
+HERO_SMS_MIN_WAIT_TIMEOUT = 45
+HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS = 3
+HERO_SMS_MAX_SEND_RETRY_ATTEMPTS = 5
 
 
 def _now() -> str:
@@ -108,8 +111,8 @@ def _normalize_hero_sms(raw: object) -> dict:
         country_pool = [item for item in default_country_pool if item not in country_blacklist] or list(default_country_pool)
     if country in country_blacklist or country not in country_pool:
         country = country_pool[0]
-    max_price_usd = _positive_float(source.get("max_price_usd"), float(defaults.get("max_price_usd") or 0.03))
-    min_price_usd = _non_negative_float(source.get("min_price_usd"), float(defaults.get("min_price_usd") or 0.0))
+    max_price_usd = _positive_float(source.get("max_price_usd"), float(defaults.get("max_price_usd") or 0.1))
+    min_price_usd = _non_negative_float(source.get("min_price_usd"), float(defaults.get("min_price_usd") or 0.045))
     min_price_usd = min(min_price_usd, max_price_usd)
     return {
         "enabled": bool(source.get("enabled") if "enabled" in source else defaults.get("enabled", False)),
@@ -119,9 +122,12 @@ def _normalize_hero_sms(raw: object) -> dict:
         "country_pool": country_pool,
         "country_blacklist": country_blacklist,
         "operator": operator,
-        "wait_timeout": min(
-            HERO_SMS_MAX_WAIT_TIMEOUT,
-            _positive_int(source.get("wait_timeout"), int(defaults.get("wait_timeout") or HERO_SMS_MAX_WAIT_TIMEOUT)),
+        "wait_timeout": max(
+            HERO_SMS_MIN_WAIT_TIMEOUT,
+            min(
+                HERO_SMS_MAX_WAIT_TIMEOUT,
+                _positive_int(source.get("wait_timeout"), int(defaults.get("wait_timeout") or HERO_SMS_MAX_WAIT_TIMEOUT)),
+            ),
         ),
         "poll_interval": min(5, _positive_int(source.get("poll_interval"), int(defaults.get("poll_interval") or 5))),
         "reuse_activation_id": "",
@@ -129,6 +135,10 @@ def _normalize_hero_sms(raw: object) -> dict:
         "auto_buy": True,
         "min_price_usd": min_price_usd,
         "max_price_usd": max_price_usd,
+        "send_retry_attempts": min(
+            HERO_SMS_MAX_SEND_RETRY_ATTEMPTS,
+            _positive_int(source.get("send_retry_attempts"), int(defaults.get("send_retry_attempts") or HERO_SMS_DEFAULT_SEND_RETRY_ATTEMPTS)),
+        ),
         "cancel_on_send_fail": True,
     }
 
@@ -150,6 +160,14 @@ def _normalize(raw: dict) -> dict:
              "threads": cfg["threads"]}
     cfg["stats"] = stats
     return cfg
+
+
+def _merge_config_update(current: dict, updates: dict) -> dict:
+    merged = {**current, **updates}
+    for key in ("mail", "hero_sms"):
+        if isinstance(current.get(key), dict) and isinstance(updates.get(key), dict):
+            merged[key] = {**current[key], **updates[key]}
+    return merged
 
 
 class RegisterService:
@@ -179,7 +197,7 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
-            self._config = _normalize({**self._config, **updates})
+            self._config = _normalize(_merge_config_update(self._config, updates))
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "hero_sms")})
             self._save()
             return self.get()
@@ -357,7 +375,7 @@ class RegisterService:
                         reputation = openai_register._record_mail_failure(exc)
                         if reputation.get("disabled_changed") and isinstance(exc, openai_register.RegisterAttemptError):
                             self._append_log(f"邮箱域名已自动拉黑: {exc.mail_domain}，原因: {reputation.get('bucket')}", "yellow")
-                        self._append_log(f"Codex CPA 任务失败: {exc}", "red")
+                        self._append_log(f"Codex CPA 任务失败: {openai_register.redact_sensitive_text(exc)}", "red")
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False

@@ -665,8 +665,9 @@ class YydsMailProvider(BaseMailProvider):
         self.api_base = str(entry.get("api_base") or "https://maliapi.215.im/v1").rstrip("/")
         self.api_key = str(entry["api_key"]).strip()
         self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
-        self.domain_learning = _bool(entry.get("domain_learning"), True)
-        self.domain_explore_rate = _ratio(entry.get("domain_explore_rate"), 0.12 if self.domain_learning else 0.0)
+        self.learning_mode = _bool(entry.get("learning_mode"), _bool(entry.get("domain_learning"), False))
+        self.domain_learning = self.learning_mode
+        self.domain_explore_rate = _ratio(entry.get("domain_explore_rate"), 0.12 if self.learning_mode else 0.0)
         self.subdomain = str(entry.get("subdomain") or "").strip()
         self.wildcard = bool(entry.get("wildcard"))
         self.session = requests.Session()
@@ -707,13 +708,16 @@ class YydsMailProvider(BaseMailProvider):
         return data if isinstance(data, list) else data.get("items") or data.get("messages") or data.get("data") or []
 
     def _select_domain(self) -> str:
-        if self.domain_learning and random.random() < self.domain_explore_rate:
-            return ""
         seed_domains = self.domain or list(YYDS_DEFAULT_DOMAINS)
-        domains: list[str] = []
-        if self.domain_learning:
-            domains.extend(domain_reputation.store.good_domains(self.name))
-        domains.extend(seed_domains)
+        if not self.learning_mode:
+            usable = domain_reputation.store.usable_domains(self.name, seed_domains)
+            if usable:
+                return _next_domain(usable)
+            raise RuntimeError("YYDSMail 可用域名为空：白名单域名已全部被拉黑，请补充 Domain 或开启学习模式")
+
+        if random.random() < self.domain_explore_rate:
+            return ""
+        domains = [*domain_reputation.store.good_domains(self.name), *seed_domains]
         preferred = domain_reputation.store.preferred_domains(self.name, domains)
         if preferred:
             return _next_domain(preferred)

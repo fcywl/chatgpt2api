@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 
 
@@ -27,13 +28,14 @@ class RegisterHeroSmsConfigTests(unittest.TestCase):
                 "country_pool": DEFAULT_COUNTRY_POOL,
                 "country_blacklist": [16, 10, 4],
                 "operator": "any",
-                "wait_timeout": 30,
+                "wait_timeout": 45,
                 "poll_interval": 5,
                 "reuse_activation_id": "",
                 "reuse_phone": "",
                 "auto_buy": True,
-                "min_price_usd": 0.0,
-                "max_price_usd": 0.03,
+                "min_price_usd": 0.045,
+                "max_price_usd": 0.1,
+                "send_retry_attempts": 3,
                 "cancel_on_send_fail": True,
             },
         )
@@ -58,6 +60,7 @@ class RegisterHeroSmsConfigTests(unittest.TestCase):
                     "auto_buy": False,
                     "min_price_usd": "0.04",
                     "max_price_usd": "0.025",
+                    "send_retry_attempts": "9",
                     "cancel_on_send_fail": False,
                 }
             }
@@ -70,13 +73,14 @@ class RegisterHeroSmsConfigTests(unittest.TestCase):
         self.assertEqual(cfg["hero_sms"]["country_pool"], [187])
         self.assertEqual(cfg["hero_sms"]["country_blacklist"], [16, 10, 4, 36])
         self.assertEqual(cfg["hero_sms"]["operator"], "any")
-        self.assertEqual(cfg["hero_sms"]["wait_timeout"], 30)
+        self.assertEqual(cfg["hero_sms"]["wait_timeout"], 45)
         self.assertEqual(cfg["hero_sms"]["poll_interval"], 2)
         self.assertEqual(cfg["hero_sms"]["reuse_activation_id"], "")
         self.assertEqual(cfg["hero_sms"]["reuse_phone"], "")
         self.assertEqual(cfg["hero_sms"]["auto_buy"], True)
         self.assertEqual(cfg["hero_sms"]["min_price_usd"], 0.025)
         self.assertEqual(cfg["hero_sms"]["max_price_usd"], 0.025)
+        self.assertEqual(cfg["hero_sms"]["send_retry_attempts"], 5)
         self.assertEqual(cfg["hero_sms"]["cancel_on_send_fail"], True)
 
     def test_register_ui_only_exposes_hero_sms_budget_and_secret(self) -> None:
@@ -109,6 +113,27 @@ class RegisterHeroSmsConfigTests(unittest.TestCase):
         self.assertIn("max_price_usd", source)
         self.assertNotIn('"max_price_usd"]', source)
         self.assertIn("startCodexRegister", source)
+
+    def test_partial_hero_sms_update_preserves_secret_fields(self) -> None:
+        from services.register_service import RegisterService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "register.json"
+            service = RegisterService(store_path)
+            service.update(
+                {
+                    "hero_sms": {
+                        "enabled": True,
+                        "api_key": "hero-secret",
+                        "max_price_usd": 0.1,
+                    }
+                }
+            )
+
+            updated = service.update({"hero_sms": {"max_price_usd": 0.2}})
+
+        self.assertEqual(updated["hero_sms"]["api_key"], "hero-secret")
+        self.assertEqual(updated["hero_sms"]["max_price_usd"], 0.2)
 
     def test_codex_poc_reads_hero_sms_config_without_printing_key(self) -> None:
         source = CODEX_POC.read_text(encoding="utf-8")
