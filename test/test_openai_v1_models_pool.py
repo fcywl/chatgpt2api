@@ -92,6 +92,35 @@ class ModelListPoolTests(unittest.TestCase):
         model_ids = {item["id"] for item in result["data"]}
         self.assertIn("auto", model_ids)
 
+    def test_list_models_uses_local_catalog_when_remote_model_discovery_fails(self) -> None:
+        calls: list[str] = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+                calls.append(access_token)
+
+            def list_models(self) -> dict:
+                raise RuntimeError("bootstrap failed: status=403")
+
+        original_backend = openai_v1_models.OpenAIBackendAPI
+        original_account_service = openai_v1_models.account_service
+        try:
+            openai_v1_models.OpenAIBackendAPI = FakeBackend
+            openai_v1_models.account_service = _FakeAccountService("blocked-pool-token")
+
+            result = openai_v1_models.list_models()
+        finally:
+            openai_v1_models.OpenAIBackendAPI = original_backend
+            openai_v1_models.account_service = original_account_service
+
+        self.assertEqual(calls, ["blocked-pool-token", ""])
+        model_ids = {item["id"] for item in result["data"]}
+        self.assertIn("auto", model_ids)
+        self.assertIn("gpt-5", model_ids)
+        self.assertIn("gpt-image-2", model_ids)
+        self.assertIn("codex-gpt-image-2", model_ids)
+
     def test_list_models_keeps_local_image_model_aliases(self) -> None:
         class FakeBackend:
             def __init__(self, access_token: str = "") -> None:
